@@ -18,6 +18,7 @@ export default function SignUp() {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const { signUp, isLoading } = useAuth();
   const navigate = useNavigate();
+  const [success, setSuccess] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -40,12 +41,17 @@ export default function SignUp() {
 
     try {
       await signUp(email, password);
-      toast.success('Account created! Please check your inbox and confirm your email before signing in.');
-      navigate('/signin');
+
+      setError('');
+      setSuccess(
+        'Account created successfully. Please check your inbox and confirm your email before signing in.'
+  );
+
+
     } catch (err: any) {
+      setSuccess('');
       setError(err.message || 'Failed to create account');
-    }
-  };
+    };
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 gradient-hero">
@@ -81,6 +87,12 @@ export default function SignUp() {
                   {error}
                 </div>
               )}
+              {success && (
+                <div className="mb-4 rounded-lg bg-green-50 border border-green-300 p-3 text-green-700 text-sm">
+                  {success}
+                </div>
+              )}
+
 
               <div className="space-y-2">
                 <Label htmlFor="name">Name (optional)</Label>
