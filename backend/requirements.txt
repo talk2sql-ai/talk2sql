@@ -5,3 +5,5 @@ sqlglot
 python-dotenv
 sqlalchemy
 uvicorn[standard]
+supabase
+requests
