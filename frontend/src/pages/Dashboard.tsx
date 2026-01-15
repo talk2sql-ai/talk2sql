@@ -1,303 +1,188 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { useAuth } from '@/contexts/AuthContext';
+import { useSearchParams } from 'react-router-dom';
+import { QueryInput } from '@/components/dashboard/QueryInput';
+import { QueryOutput } from '@/components/dashboard/QueryOutput';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from '@/components/ui/card';
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
-import { Label } from '@/components/ui/label';
-import { Textarea } from '@/components/ui/textarea';
-import { Database, Upload, ArrowRight, SkipForward, Save } from 'lucide-react';
-import { toast } from 'sonner';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Play, Loader2, Code2, Sparkles, Terminal, X } from 'lucide-react';
+import SidebarLayout from '@/components/layout/SidebarLayout';
 
-export default function OnboardingPage() {
-  const { user } = useAuth();
-
-  const userEmail = (() => {
-    const savedUser = sessionStorage.getItem('auth_user');
-    if (savedUser) {
-      try {
-        return JSON.parse(savedUser).email;
-      } catch (e) {
-        console.error('Error parsing auth_user:', e);
-      }
-    }
-    return user?.email || 'default';
-  })();
-
-  const [database, setDatabase] = useState(() => localStorage.getItem(`selected_db_${userEmail}`) || 'mysql');
-  const [schema, setSchema] = useState(() => localStorage.getItem(`last_schema_${userEmail}`) || '');
+export default function Dashboard() {
+  const [searchParams] = useSearchParams();
+  const [operation, setOperation] = useState('generate');
+  const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [onboardingCompleted, setOnboardingCompleted] = useState(
-    () => localStorage.getItem(`onboarding_completed_${userEmail}`) === 'true'
-  );
-  const navigate = useNavigate();
+  const [output, setOutput] = useState<{ sql?: string; explanation?: string; suggestions?: { sql: string; title: string }[] } | null>(null);
+  const [error, setError] = useState('');
+  const [numSuggestions, setNumSuggestions] = useState(5);
 
   useEffect(() => {
-    const db = localStorage.getItem(`selected_db_${userEmail}`) || 'mysql';
-    const sc = localStorage.getItem(`last_schema_${userEmail}`) || '';
-    const completed = localStorage.getItem(`onboarding_completed_${userEmail}`) === 'true';
-
-    setDatabase(db);
-    setSchema(sc);
-    setOnboardingCompleted(completed);
-
-    if (sc && completed) {
-      const syncSchema = async () => {
-        try {
-          const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-          await fetch(`${apiUrl}/upload-schema`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              db_key: 'default',
-              schema_sql: sc,
-              database_type: db,
-            }),
-          });
-        } catch (err) {
-          console.error('Auto-sync failed:', err);
-        }
-      };
-      syncSchema();
+    const op = searchParams.get('op');
+    if (op) {
+      setOperation(op);
+      // Clear state when switching operations
+      setInput('');
+      setOutput(null);
+      setError('');
     }
-  }, [userEmail]);
+  }, [searchParams]);
 
-  const handleComplete = async () => {
-    if (!schema.trim()) {
-      toast.error('Please provide a schema or skip for now');
+  const handleRunQuery = async () => {
+    if (!input.trim()) {
+      setError('Please enter a query or description');
       return;
     }
 
+    setError('');
     setIsLoading(true);
+    setOutput(null);
+
     try {
       const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-      const response = await fetch(`${apiUrl}/upload-schema`, {
+
+      // Determine endpoint based on operation
+      let endpoint = '/generate-sql';
+      if (operation === 'fix') endpoint = '/fix-sql';
+      if (operation === 'explain') endpoint = '/explain-sql';
+      if (operation === 'optimize') endpoint = '/optimize-sql';
+      if (operation === 'suggest') endpoint = '/suggest-next';
+
+      const response = await fetch(`${apiUrl}${endpoint}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
+          question: operation === 'generate' ? input : undefined,
+          sql: operation !== 'generate' ? input : undefined,
           db_key: 'default',
-          schema_sql: schema,
-          database_type: database,
+          max_rows: 100,
+          max_suggestions: operation === 'suggest' ? numSuggestions : undefined
         }),
       });
 
-      if (!response.ok) throw new Error('Failed to upload schema');
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || errorData.message || 'Failed to process query');
+      }
 
-      toast.success(onboardingCompleted ? 'Schema updated!' : 'Onboarding completed!');
-      localStorage.setItem(`onboarding_completed_${userEmail}`, 'true');
-      localStorage.setItem(`selected_db_${userEmail}`, database);
-      localStorage.setItem(`last_schema_${userEmail}`, schema);
-      setOnboardingCompleted(true);
-
-      if (!onboardingCompleted) navigate('/dashboard');
-    } catch (err) {
-      toast.error('Error uploading schema');
-      console.error(err);
+      const data = await response.json();
+      if (operation === 'suggest') {
+        setOutput({
+          suggestions: data.queries || [],
+          explanation: data.notes || '',
+        });
+      } else {
+        setOutput({
+          sql: data.sql || '',
+          explanation: data.explanation || '',
+        });
+      }
+    } catch (err: any) {
+      console.error('API Error:', err);
+      setError(err.message || 'An unexpected error occurred');
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleSkip = () => {
-    localStorage.setItem(`onboarding_completed_${userEmail}`, 'true');
-    localStorage.setItem(`selected_db_${userEmail}`, database);
-    navigate('/dashboard');
-  };
-
-  // ✅ "Schema settings" screen (after onboarding)
-  if (onboardingCompleted) {
-    return (
-      <div className="h-screen overflow-hidden">
-        <div className="h-full overflow-y-auto p-8">
-          <div className="max-w-4xl mx-auto space-y-6">
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-              <div>
-                <h1 className="text-3xl font-bold tracking-tight">Database Schema</h1>
-                <p className="text-muted-foreground mt-1 text-sm">
-                  Configure your database connection and DDL schema.
-                </p>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 gap-6">
-              <Card className="border-border/50 bg-card/50 shadow-lg glow-primary-sm overflow-hidden">
-                <CardHeader className="border-b border-border/50 pb-4">
-                  <CardTitle className="text-lg flex items-center gap-2">
-                    <Database className="h-5 w-5 text-primary" />
-                    Connection Details
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="pt-6 space-y-6">
-                  <div className="space-y-3">
-                    <Label className="text-sm font-medium">Database Type</Label>
-                    <Select value={database} onValueChange={setDatabase}>
-                      <SelectTrigger className="w-full md:w-[240px] bg-muted/30">
-                        <SelectValue placeholder="Select Database" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="mysql">MySQL 8.0+</SelectItem>
-                        <SelectItem value="postgresql">PostgreSQL 14+</SelectItem>
-                        <SelectItem value="sqlite">SQLite 3</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </CardContent>
-              </Card>
-
-              <Card className="border-border/50 bg-card/50 shadow-lg glow-primary-sm overflow-hidden min-h-[500px] flex flex-col">
-                <CardHeader className="border-b border-border/50 pb-4">
-                  <CardTitle className="text-lg flex items-center gap-2">
-                    <Upload className="h-5 w-5 text-primary" />
-                    DDL Schema
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="p-0 flex-1 min-h-0">
-                  <Textarea
-                    placeholder="CREATE TABLE users ( id INT PRIMARY KEY, ... );"
-                    className="h-full w-full font-mono text-sm bg-transparent border-none focus-visible:ring-0 resize-none p-6 overflow-auto"
-                    value={schema}
-                    onChange={(e) => setSchema(e.target.value)}
-                  />
-                </CardContent>
-                <CardFooter className="flex justify-end border-t border-border/50 p-4 bg-muted/10">
-                  <Button
-                    onClick={handleComplete}
-                    disabled={isLoading}
-                    className="gradient-primary text-primary-foreground glow-primary-sm min-w-[160px]"
-                  >
-                    {isLoading ? (
-                      'Updating...'
-                    ) : (
-                      <>
-                        <Save className="mr-2 h-4 w-4" />
-                        Update Workspace
-                      </>
-                    )}
-                  </Button>
-                </CardFooter>
-              </Card>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ✅ Onboarding screen (fit to screen, no page scroll)
   return (
-    <div className="h-screen w-screen overflow-hidden bg-background">
-      <div className="h-full w-full flex items-center justify-center px-4 gradient-hero">
-        <div className="w-full max-w-2xl">
-          <div className="text-center mb-6">
-            <div className="inline-flex items-center gap-2 mb-3">
-              <div className="p-3 rounded-xl gradient-primary glow-primary-sm">
-                <Database className="h-8 w-8 text-primary-foreground" />
-              </div>
-              <div className="flex flex-col text-left">
-                <span className="font-bold text-3xl leading-none">
-                  Talk2SQL<span className="text-primary">.ai</span>
-                </span>
-                <span className="text-xs font-bold text-muted-foreground/50 tracking-[0.2em] mt-1 ml-0.5">
-                  BETA
-                </span>
+    <div className="flex-1 flex flex-col h-full bg-background/50 overflow-hidden">
+      {/* Top Pane: Generate / Input Section */}
+      <div className="flex-1 p-6 overflow-y-auto space-y-6 lg:max-w-5xl lg:mx-auto w-full">
+
+
+        <Card className="border-border/50 bg-card/50 shadow-lg glow-primary-sm overflow-hidden">
+          <CardHeader className="pb-3 border-b border-border/50">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <Terminal className="h-4 w-4 text-primary" />
+              {operation === 'generate' ? 'Describe your query' :
+                operation === 'fix' ? 'SQL to Fix' :
+                  operation === 'explain' ? 'SQL to Explain' :
+                    operation === 'optimize' ? 'SQL to Optimize' :
+                      operation === 'suggest' ? 'SQL for AI Suggestions' :
+                        'SQL to process'}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            <div className="p-4">
+              <QueryInput
+                value={input}
+                onChange={setInput}
+                operation={operation}
+              />
+
+              {operation === 'suggest' && (
+                <div className="mt-4 flex items-center gap-4">
+                  <label className="text-sm font-medium text-muted-foreground whitespace-nowrap">
+                    Number of Suggestions:
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="10"
+                    value={numSuggestions}
+                    onChange={(e) => setNumSuggestions(parseInt(e.target.value) || 5)}
+                    className="w-20 bg-muted/30 border border-border/50 rounded-md px-3 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+                  />
+                </div>
+              )}
+
+              {error && (
+                <div className="mt-4 p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-destructive text-sm flex items-center gap-2">
+                  <X className="h-4 w-4" />
+                  {error}
+                </div>
+              )}
+
+              <div className="mt-4 flex justify-end">
+                <Button
+                  onClick={handleRunQuery}
+                  disabled={isLoading}
+                  className="gradient-primary text-primary-foreground glow-primary-sm min-w-[140px]"
+                >
+                  {isLoading ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Processing...
+                    </>
+                  ) : (
+                    <>
+                      <Play className="mr-2 h-4 w-4" />
+                      Run {operation}
+                    </>
+                  )}
+                </Button>
               </div>
             </div>
-            <h1 className="text-2xl font-bold">Setup Your Workspace</h1>
-            <p className="text-muted-foreground mt-2">Choose your database and provide your schema to get started.</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Bottom Pane: Query Editor / Output Section */}
+      <div className="h-[400px] border-t border-primary/20 bg-background p-6 shadow-2xl relative z-10">
+        <div className="lg:max-w-5xl lg:mx-auto w-full h-full flex flex-col">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <Code2 className="h-5 w-5 text-primary" />
+              {operation === 'explain' ? 'Explanation' : 'Query Editor'}
+            </h2>
+            {output?.sql && (
+              <Button variant="outline" size="sm" onClick={() => navigator.clipboard.writeText(output.sql)}>
+                Copy SQL
+              </Button>
+            )}
           </div>
 
-          <Card className="border-border/50 shadow-2xl bg-card/80 backdrop-blur-sm">
-            <CardHeader className="pb-3">
-              <CardTitle>Onboarding</CardTitle>
-              <CardDescription>Step 1: Database & Schema</CardDescription>
-            </CardHeader>
-
-            <CardContent className="space-y-6">
-              <div className="space-y-4">
-                <Label className="text-base font-semibold">1. Choose your Database Engine</Label>
-                <RadioGroup
-                  value={database}
-                  onValueChange={setDatabase}
-                  className="grid grid-cols-1 md:grid-cols-3 gap-4"
-                >
-                  <div>
-                    <RadioGroupItem value="mysql" id="mysql" className="peer sr-only" />
-                    <Label
-                      htmlFor="mysql"
-                      className="flex flex-col items-center justify-between rounded-md border-2 border-muted bg-popover p-4 hover:bg-accent hover:text-accent-foreground peer-data-[state=checked]:border-primary [&:has([data-state=checked])]:border-primary cursor-pointer transition-all"
-                    >
-                      <Database className="mb-3 h-6 w-6" />
-                      <span className="font-medium">MySQL</span>
-                    </Label>
-                  </div>
-
-                  <div>
-                    <RadioGroupItem value="postgresql" id="postgresql" className="peer sr-only" />
-                    <Label
-                      htmlFor="postgresql"
-                      className="flex flex-col items-center justify-between rounded-md border-2 border-muted bg-popover p-4 hover:bg-accent hover:text-accent-foreground peer-data-[state=checked]:border-primary [&:has([data-state=checked])]:border-primary cursor-pointer transition-all"
-                    >
-                      <Database className="mb-3 h-6 w-6" />
-                      <span className="font-medium">PostgreSQL</span>
-                    </Label>
-                  </div>
-
-                  <div>
-                    <RadioGroupItem value="sqlite" id="sqlite" className="peer sr-only" />
-                    <Label
-                      htmlFor="sqlite"
-                      className="flex flex-col items-center justify-between rounded-md border-2 border-muted bg-popover p-4 hover:bg-accent hover:text-accent-foreground peer-data-[state=checked]:border-primary [&:has([data-state=checked])]:border-primary cursor-pointer transition-all"
-                    >
-                      <Database className="mb-3 h-6 w-6" />
-                      <span className="font-medium">SQLite</span>
-                    </Label>
-                  </div>
-                </RadioGroup>
-              </div>
-
-              <div className="space-y-3">
-                <Label className="text-base font-semibold flex items-center gap-2">
-                  <Upload className="h-4 w-4" />
-                  2. Upload or Paste Schema (DDL)
-                </Label>
-
-                {/* ✅ fixed height, textarea scrolls internally */}
-                <Textarea
-                  placeholder="CREATE TABLE users ( id INT PRIMARY KEY, ... );"
-                  className="h-[160px] max-h-[160px] font-mono text-sm bg-muted/50 border-muted-foreground/20 focus-visible:ring-primary overflow-auto resize-none"
-                  value={schema}
-                  onChange={(e) => setSchema(e.target.value)}
-                />
-
-                <p className="text-xs text-muted-foreground">
-                  Paste your SQL DDL statements (CREATE TABLE, etc.) to help the AI understand your data structure.
-                </p>
-              </div>
-            </CardContent>
-
-            <CardFooter className="flex flex-col sm:flex-row gap-4 pt-4 border-t border-border/50">
-              <Button variant="outline" className="w-full flex items-center gap-2" onClick={handleSkip}>
-                <SkipForward className="h-4 w-4" />
-                Skip for now
-              </Button>
-
-              <Button
-                className="w-full gradient-primary text-primary-foreground glow-primary-sm flex items-center gap-2"
-                onClick={handleComplete}
-                disabled={isLoading}
-              >
-                {isLoading ? 'Processing...' : 'Complete Setup'}
-                {!isLoading && <ArrowRight className="h-4 w-4" />}
-              </Button>
-            </CardFooter>
-          </Card>
+          <div className="flex-1 overflow-y-auto rounded-xl border border-primary/20 bg-white">
+            <QueryOutput
+              sql={output?.sql || ''}
+              explanation={output?.explanation}
+              suggestions={output?.suggestions}
+              isLoading={isLoading}
+              operation={operation}
+            />
+          </div>
         </div>
       </div>
     </div>
