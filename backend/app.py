@@ -735,11 +735,11 @@ async def signup(req: UserAuthRequest):
              raise HTTPException(status_code=400, detail="Signup failed")
              
         # Create profile
-        supabase.table("profiles").insert({
-            "id": res.user.id,
-            "email": req.email,
-            "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
-        }).execute()
+       # supabase.table("profiles").insert({
+         #   "id": res.user.id,
+        #    "email": req.email,
+       #     "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
+       # }).execute()
         
         return {"user": {"email": req.email, "id": res.user.id}, "message": "Signup successful"}
     except Exception as e:
@@ -1066,6 +1066,7 @@ def suggest_joins(req: SuggestJoinsRequest):
         graph_edges=graph_edges[: req.max_suggestions],
         notes="Direct FK joins from schema."
     )
+
 
 
 
