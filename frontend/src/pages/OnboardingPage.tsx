@@ -192,9 +192,9 @@ export default function OnboardingPage() {
     }
 
     return (
-        <div className="fixed inset-0 z-[100] bg-background">
-            <div className="min-h-screen flex items-center justify-center px-4 gradient-hero overflow-y-auto py-12">
-                <div className="w-full max-w-2xl">
+        <div className="fixed inset-0 z-[100] bg-background overflow-y-auto">
+            <div className="min-h-full px-4 py-12 gradient-hero">
+              <div className="w-full max-w-2xl mx-auto">
                     <div className="text-center mb-8">
                         <div className="inline-flex items-center gap-2 mb-4">
                             <div className="p-3 rounded-xl gradient-primary glow-primary-sm">
@@ -299,3 +299,4 @@ export default function OnboardingPage() {
         </div>
     );
 }
+
