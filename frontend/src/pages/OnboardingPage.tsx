@@ -192,8 +192,8 @@ export default function OnboardingPage() {
     }
 
     return (
-        <div className="fixed inset-0 z-[100] bg-background overflow-y-auto">
-            <div className="min-h-full px-4 py-12 gradient-hero">
+        <div className="fixed inset-0 bg-background flex items-center justify-center">
+            <div className="w-full h-full px-4 py-6 gradient-hero flex items-center justify-center">
               <div className="w-full max-w-2xl mx-auto">
                     <div className="text-center mb-8">
                         <div className="inline-flex items-center gap-2 mb-4">
@@ -213,12 +213,12 @@ export default function OnboardingPage() {
                         <p className="text-muted-foreground mt-2">Choose your database and provide your schema to get started.</p>
                     </div>
 
-                    <Card className="border-border/50 shadow-2xl bg-card/80 backdrop-blur-sm">
+                    <Card className="border-border/50 shadow-2xl bg-card/80 backdrop-blur-sm max-h-[80vh] overflow-hidden flex flex-col">
                         <CardHeader>
                             <CardTitle>Onboarding</CardTitle>
                             <CardDescription>Step 1: Database & Schema</CardDescription>
                         </CardHeader>
-                        <CardContent className="space-y-8">
+                        <CardContent className="space-y-6 flex-1 overflow-hidden">
                             <div className="space-y-4">
                                 <Label className="text-base font-semibold">1. Choose your Database Engine</Label>
                                 <RadioGroup
@@ -266,7 +266,7 @@ export default function OnboardingPage() {
                                 </Label>
                                 <Textarea
                                     placeholder="CREATE TABLE users ( id INT PRIMARY KEY, ... );"
-                                    className="min-h-[200px] font-mono text-sm bg-muted/50 border-muted-foreground/20 focus-visible:ring-primary"
+                                     className="h-[120px] font-mono text-sm bg-muted/50 border-muted-foreground/20 focus-visible:ring-primary resize-none"
                                     value={schema}
                                     onChange={(e) => setSchema(e.target.value)}
                                 />
@@ -275,7 +275,7 @@ export default function OnboardingPage() {
                                 </p>
                             </div>
                         </CardContent>
-                        <CardFooter className="flex flex-col sm:flex-row gap-4 pt-6 border-t border-border/50">
+                        <CardFooter className="flex flex-row gap-3 pt-4 border-t border-border/50">
                             <Button
                                 variant="outline"
                                 className="w-full flex items-center gap-2"
@@ -299,4 +299,5 @@ export default function OnboardingPage() {
         </div>
     );
 }
+
 
