@@ -27,7 +27,7 @@ app.add_middleware(
 )
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -1066,5 +1066,6 @@ def suggest_joins(req: SuggestJoinsRequest):
         graph_edges=graph_edges[: req.max_suggestions],
         notes="Direct FK joins from schema."
     )
+
 
 
