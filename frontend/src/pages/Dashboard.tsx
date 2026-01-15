@@ -4,15 +4,18 @@ import { QueryInput } from '@/components/dashboard/QueryInput';
 import { QueryOutput } from '@/components/dashboard/QueryOutput';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Play, Loader2, Code2, Sparkles, Terminal, X } from 'lucide-react';
-import SidebarLayout from '@/components/layout/SidebarLayout';
+import { Play, Loader2, Code2, Terminal, X } from 'lucide-react';
 
 export default function Dashboard() {
   const [searchParams] = useSearchParams();
   const [operation, setOperation] = useState('generate');
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [output, setOutput] = useState<{ sql?: string; explanation?: string; suggestions?: { sql: string; title: string }[] } | null>(null);
+  const [output, setOutput] = useState<{
+    sql?: string;
+    explanation?: string;
+    suggestions?: { sql: string; title: string }[];
+  } | null>(null);
   const [error, setError] = useState('');
   const [numSuggestions, setNumSuggestions] = useState(5);
 
@@ -20,7 +23,6 @@ export default function Dashboard() {
     const op = searchParams.get('op');
     if (op) {
       setOperation(op);
-      // Clear state when switching operations
       setInput('');
       setOutput(null);
       setError('');
@@ -40,25 +42,26 @@ export default function Dashboard() {
     try {
       const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-      // Determine endpoint based on operation
       let endpoint = '/generate-sql';
       if (operation === 'fix') endpoint = '/fix-sql';
       if (operation === 'explain') endpoint = '/explain-sql';
       if (operation === 'optimize') endpoint = '/optimize-sql';
       if (operation === 'suggest') endpoint = '/suggest-next';
 
+      const payload: any = {
+        db_key: 'default',
+        max_rows: 100,
+      };
+
+      if (operation === 'generate') payload.question = input;
+      else payload.sql = input;
+
+      if (operation === 'suggest') payload.max_suggestions = numSuggestions;
+
       const response = await fetch(`${apiUrl}${endpoint}`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          question: operation === 'generate' ? input : undefined,
-          sql: operation !== 'generate' ? input : undefined,
-          db_key: 'default',
-          max_rows: 100,
-          max_suggestions: operation === 'suggest' ? numSuggestions : undefined
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
 
       if (!response.ok) {
@@ -67,6 +70,7 @@ export default function Dashboard() {
       }
 
       const data = await response.json();
+
       if (operation === 'suggest') {
         setOutput({
           suggestions: data.queries || [],
@@ -87,30 +91,31 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-background/50 overflow-hidden">
-      {/* Top Pane: Generate / Input Section */}
-      <div className="flex-1 p-6 overflow-y-auto space-y-6 lg:max-w-5xl lg:mx-auto w-full">
-
-
+    // ✅ lock to viewport, prevent page scroll
+    <div className="h-screen flex flex-col bg-background/50 overflow-hidden">
+      {/* ✅ Top Pane should NOT scroll; it should shrink-wrap content */}
+      <div className="shrink-0 p-6 space-y-6 lg:max-w-5xl lg:mx-auto w-full">
         <Card className="border-border/50 bg-card/50 shadow-lg glow-primary-sm overflow-hidden">
           <CardHeader className="pb-3 border-b border-border/50">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Terminal className="h-4 w-4 text-primary" />
-              {operation === 'generate' ? 'Describe your query' :
-                operation === 'fix' ? 'SQL to Fix' :
-                  operation === 'explain' ? 'SQL to Explain' :
-                    operation === 'optimize' ? 'SQL to Optimize' :
-                      operation === 'suggest' ? 'SQL for AI Suggestions' :
-                        'SQL to process'}
+              {operation === 'generate'
+                ? 'Describe your query'
+                : operation === 'fix'
+                ? 'SQL to Fix'
+                : operation === 'explain'
+                ? 'SQL to Explain'
+                : operation === 'optimize'
+                ? 'SQL to Optimize'
+                : operation === 'suggest'
+                ? 'SQL for AI Suggestions'
+                : 'SQL to process'}
             </CardTitle>
           </CardHeader>
+
           <CardContent className="p-0">
             <div className="p-4">
-              <QueryInput
-                value={input}
-                onChange={setInput}
-                operation={operation}
-              />
+              <QueryInput value={input} onChange={setInput} operation={operation} />
 
               {operation === 'suggest' && (
                 <div className="mt-4 flex items-center gap-4">
@@ -159,22 +164,23 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* Bottom Pane: Query Editor / Output Section */}
-      <div className="h-[400px] border-t border-primary/20 bg-background p-6 shadow-2xl relative z-10">
-        <div className="lg:max-w-5xl lg:mx-auto w-full h-full flex flex-col">
-          <div className="flex items-center justify-between mb-4">
+      {/* ✅ Bottom Pane takes remaining space; output scrolls inside */}
+      <div className="flex-1 min-h-0 border-t border-primary/20 bg-background p-6 shadow-2xl relative z-10 overflow-hidden">
+        <div className="lg:max-w-5xl lg:mx-auto w-full h-full flex flex-col min-h-0">
+          <div className="flex items-center justify-between mb-4 shrink-0">
             <h2 className="text-lg font-semibold flex items-center gap-2">
               <Code2 className="h-5 w-5 text-primary" />
               {operation === 'explain' ? 'Explanation' : 'Query Editor'}
             </h2>
+
             {output?.sql && (
-              <Button variant="outline" size="sm" onClick={() => navigator.clipboard.writeText(output.sql)}>
+              <Button variant="outline" size="sm" onClick={() => navigator.clipboard.writeText(output.sql || '')}>
                 Copy SQL
               </Button>
             )}
           </div>
 
-          <div className="flex-1 overflow-y-auto rounded-xl border border-primary/20 bg-white">
+          <div className="flex-1 min-h-0 overflow-y-auto rounded-xl border border-primary/20 bg-white">
             <QueryOutput
               sql={output?.sql || ''}
               explanation={output?.explanation}
