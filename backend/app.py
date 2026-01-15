@@ -27,7 +27,7 @@ app.add_middleware(
 )
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -720,69 +720,57 @@ class SuggestJoinsResponse(BaseModel):
 @app.post("/api/signup")
 async def signup(req: UserAuthRequest):
     try:
-        # Check if email already exists in profiles
-        existing = supabase.table("profiles").select("id").eq("email", req.email).execute()
-        if existing.data and len(existing.data) > 0:
-            raise HTTPException(status_code=400, detail="Email already exists")
-
-        # Sign up user with Supabase Auth
         res = supabase.auth.sign_up({
             "email": req.email,
             "password": req.password,
         })
-        
+
         if not res.user:
-             raise HTTPException(status_code=400, detail="Signup failed")
-             
-        # Create profile
-       # supabase.table("profiles").insert({
-         #   "id": res.user.id,
-        #    "email": req.email,
-       #     "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
-       # }).execute()
-        
-        return {"user": {"email": req.email, "id": res.user.id}, "message": "Signup successful"}
+            raise HTTPException(status_code=400, detail="Signup failed")
+
+        # Optional: create profile immediately (works only if using service role key)
+        supabase.table("profiles").upsert({
+            "id": res.user.id,
+            "email": req.email,
+            "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }, on_conflict="id").execute()
+
+        return {"user": {"email": req.email, "id": res.user.id}, "message": "Signup successful. Check email to confirm."}
+
     except Exception as e:
+        msg = str(e).lower()
+        if "user already registered" in msg or "already exists" in msg:
+            raise HTTPException(status_code=400, detail="Email already exists")
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/login")
 async def login(req: UserAuthRequest):
     try:
-        # Check if email exists in profiles first
-        existing = supabase.table("profiles").select("id").eq("email", req.email).execute()
-        if not existing.data or len(existing.data) == 0:
-            raise HTTPException(status_code=401, detail="invalid email")
+        # 1) Authenticate against Supabase Auth (source of truth)
+        res = supabase.auth.sign_in_with_password({
+            "email": req.email,
+            "password": req.password,
+        })
 
-        # Sign in user with Supabase Auth
-        try:
-            res = supabase.auth.sign_in_with_password({
-                "email": req.email,
-                "password": req.password,
-            })
-            
-            if not res.user:
-                 raise HTTPException(status_code=401, detail="invalid email or password")
-                 
-            # Update last login
-            supabase.table("profiles").update({
-                "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
-            }).eq("id", res.user.id).execute()
-            
-            return {"user": {"email": req.email, "id": res.user.id}, "message": "Login successful"}
-        except Exception as e:
-            error_str = str(e)
-            # If it's a known auth error, we can be specific, otherwise show the error
-            if "invalid login credentials" in error_str.lower():
-                raise HTTPException(status_code=401, detail="invalid email or password")
-            elif "email not confirmed" in error_str.lower():
-                raise HTTPException(status_code=401, detail="Email not confirmed. Please check your inbox.")
-            else:
-                raise HTTPException(status_code=401, detail=f"Authentication error: {error_str}")
-            
-    except HTTPException as he:
-        raise he
+        if not res.user:
+            raise HTTPException(status_code=401, detail="invalid email or password")
+
+        # 2) Ensure profile exists (upsert)
+        supabase.table("profiles").upsert({
+            "id": res.user.id,
+            "email": req.email,
+            "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }, on_conflict="id").execute()
+
+        return {"user": {"email": req.email, "id": res.user.id}, "message": "Login successful"}
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        error_str = str(e).lower()
+        if "invalid login credentials" in error_str:
+            raise HTTPException(status_code=401, detail="invalid email or password")
+        if "email not confirmed" in error_str:
+            raise HTTPException(status_code=401, detail="Email not confirmed. Please verify your email.")
+        raise HTTPException(status_code=401, detail=f"Authentication error: {str(e)}")
 
 @app.post("/upload-schema")
 def upload_schema(req: UploadSchemaRequest):
@@ -1066,6 +1054,7 @@ def suggest_joins(req: SuggestJoinsRequest):
         graph_edges=graph_edges[: req.max_suggestions],
         notes="Direct FK joins from schema."
     )
+
 
 
 
