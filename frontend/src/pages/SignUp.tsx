@@ -16,13 +16,15 @@ export default function SignUp() {
   const [error, setError] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [success, setSuccess] = useState('');
+
   const { signUp, isLoading } = useAuth();
   const navigate = useNavigate();
-  const [success, setSuccess] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setSuccess('');
 
     if (!email || !password || !confirmPassword) {
       setError('Please fill in all fields');
@@ -42,16 +44,18 @@ export default function SignUp() {
     try {
       await signUp(email, password);
 
-      setError('');
       setSuccess(
         'Account created successfully. Please check your inbox and confirm your email before signing in.'
-  );
+      );
 
-
+      // Optional: show toast + redirect
+      // toast.success('Account created. Please verify your email.');
+      // navigate('/signin');
     } catch (err: any) {
-      setSuccess('');
-      setError(err.message || 'Failed to create account');
-    };
+      setError(err?.message || 'Failed to create account');
+      toast.error(err?.message || 'Failed to create account');
+    }
+  };
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4 gradient-hero">
@@ -76,10 +80,9 @@ export default function SignUp() {
         <Card className="border-border/50 shadow-xl">
           <CardHeader className="space-y-1">
             <CardTitle className="text-2xl font-bold">Create Account</CardTitle>
-            <CardDescription>
-              Enter your details to create a new account
-            </CardDescription>
+            <CardDescription>Enter your details to create a new account</CardDescription>
           </CardHeader>
+
           <CardContent>
             <form onSubmit={handleSubmit} className="space-y-4">
               {error && (
@@ -87,12 +90,12 @@ export default function SignUp() {
                   {error}
                 </div>
               )}
+
               {success && (
                 <div className="mb-4 rounded-lg bg-green-50 border border-green-300 p-3 text-green-700 text-sm">
                   {success}
                 </div>
               )}
-
 
               <div className="space-y-2">
                 <Label htmlFor="name">Name (optional)</Label>
@@ -130,7 +133,7 @@ export default function SignUp() {
                   <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                   <Input
                     id="password"
-                    type={showPassword ? "text" : "password"}
+                    type={showPassword ? 'text' : 'password'}
                     placeholder="••••••••"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
@@ -138,14 +141,10 @@ export default function SignUp() {
                   />
                   <button
                     type="button"
-                    onClick={() => setShowPassword(!showPassword)}
+                    onClick={() => setShowPassword((v) => !v)}
                     className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
                   >
-                    {showPassword ? (
-                      <EyeOff className="h-4 w-4" />
-                    ) : (
-                      <Eye className="h-4 w-4" />
-                    )}
+                    {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </button>
                 </div>
               </div>
@@ -156,7 +155,7 @@ export default function SignUp() {
                   <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                   <Input
                     id="confirmPassword"
-                    type={showConfirmPassword ? "text" : "password"}
+                    type={showConfirmPassword ? 'text' : 'password'}
                     placeholder="••••••••"
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
@@ -164,7 +163,7 @@ export default function SignUp() {
                   />
                   <button
                     type="button"
-                    onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                    onClick={() => setShowConfirmPassword((v) => !v)}
                     className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
                   >
                     {showConfirmPassword ? (
@@ -203,4 +202,4 @@ export default function SignUp() {
       </div>
     </div>
   );
-};
+}
