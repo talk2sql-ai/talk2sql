@@ -323,35 +323,175 @@ def upload_schema(req: UploadSchemaRequest):
 
 @app.post("/generate-sql", response_model=SQLResponse)
 async def generate_sql(req: Text2SQLRequest):
-    schema = require_schema(req.db_key)
-    dialect = normalize_dialect(req.database_type)
+    full_schema = require_schema(req.db_key)
+    schema_subset = shortlist_schema(full_schema, req.question, max_tables=8)
+    user_prompt = build_generate_user_prompt(
+        req.question,
+        schema_subset,
+        req.constraints,
+        req.max_rows
+    )
+    raw = await openrouter_chat(SYSTEM_GENERATE, user_prompt)
+    sql = clean_sql_only(raw)
 
-    system = get_system_prompt("generate", req.database_type)
-    user = f"Question:\n{req.question}\nSchema:\n{json.dumps(schema, indent=2)}"
+    sql = enforce_safety(sql)
+    sql = enforce_limit(sql, req.max_rows)
+    validate_sql(sql, "mysql")
 
-    raw = await openrouter_chat(system, user)
-    sql = enforce_single_statement(clean_sql_only(raw))
-    validate_sql(sql, dialect)
+    return SQLResponse(sql=sql, notes="Generated via OpenRouter (MySQL).")
 
-    return SQLResponse(sql=sql)
 
 @app.post("/fix-sql", response_model=SQLResponse)
 async def fix_sql(req: FixSQLRequest):
-    schema = require_schema(req.db_key)
-    dialect = normalize_dialect(req.database_type)
+    full_schema = require_schema(req.db_key)
+    sql_in = clean_sql_only(req.sql)
+    if not sql_in:
+        raise HTTPException(status_code=400, detail="Empty input SQL.")
 
-    system = get_system_prompt("fix", req.database_type)
-    user = f"Fix this SQL:\n{req.sql}\nSchema:\n{json.dumps(schema, indent=2)}"
+    error_msg = (req.error or "").strip()
 
-    raw = await openrouter_chat(system, user)
-    sql = enforce_single_statement(clean_sql_only(raw))
-    validate_sql(sql, dialect)
+    # Deterministic replacement if error mentions Unknown column
+    m = re.search(r"Unknown column '([^']+)'", error_msg, re.IGNORECASE)
+    if m:
+        bad_col = m.group(1)
+        t = re.search(r"from\s+([a-zA-Z_][\w]*)", sql_in, re.IGNORECASE)
+        if t:
+            table = t.group(1)
+            replacement = find_closest_column(full_schema, table, bad_col)
+            if replacement and replacement.lower() != bad_col.lower():
+                sql_in = re.sub(rf"\b{re.escape(bad_col)}\b", replacement, sql_in)
 
-    return SQLResponse(sql=sql)
+    shortlist_text = f"{sql_in}\n{error_msg}"
+    schema_subset = shortlist_schema(full_schema, shortlist_text, max_tables=10)
+
+    if not error_msg:
+        try:
+            sqlglot.parse_one(sql_in, read="mysql")
+            error_msg = "SQL may be valid but needs a compatibility/intent-preserving fix."
+        except Exception as e:
+            error_msg = f"Parse error: {str(e)}"
+
+    # First attempt
+    raw1 = await openrouter_chat(SYSTEM_FIX, build_fix_user_prompt(sql_in, error_msg, schema_subset))
+    sql1 = clean_sql_only(raw1)
+
+    # Retry once if empty
+    if not sql1:
+        raw2 = await openrouter_chat(
+            SYSTEM_FIX,
+            build_fix_user_prompt(
+                sql_in,
+                error_msg + " IMPORTANT: Output ONLY a single non-empty MySQL query. No fences. No commentary.",
+                schema_subset
+            )
+        )
+        sql2 = clean_sql_only(raw2)
+        if not sql2:
+            raise HTTPException(status_code=400, detail=f"Fixer returned empty SQL. Raw: {raw2[:300]}")
+        sql = sql2
+        raw_used = raw2
+    else:
+        sql = sql1
+        raw_used = raw1
+
+    sql = enforce_safety(sql)
+    sql = enforce_limit(sql, 100)
+
+    # Validate after enforcement
+    try:
+        validate_sql(sql, "mysql")
+    except HTTPException as e:
+        raise HTTPException(status_code=400, detail=f"{e.detail}. Raw output: {raw_used[:300]}")
+
+    return SQLResponse(sql=sql, notes="Fixed via deterministic map + OpenRouter (retry-on-empty).")
+
 
 @app.post("/explain-sql", response_model=ExplainResponse)
 async def explain_sql(req: ExplainSQLRequest):
-    system = get_system_prompt("explain", req.database_type)
-    raw = await openrouter_chat(system, req.sql)
+    sql = clean_sql_only(req.sql)
+    sql = enforce_safety(sql)
+    validate_sql(sql, "mysql")
+
+    raw = await openrouter_chat(SYSTEM_EXPLAIN, build_explain_user_prompt(sql))
     return ExplainResponse(explanation=raw.strip())
+
+@app.post("/optimize-sql", response_model=SQLResponse)
+async def optimize_sql(req: OptimizeSQLRequest):
+    full_schema = require_schema(req.db_key)
+    sql_in = clean_sql_only(req.sql)
+    if not sql_in:
+        raise HTTPException(status_code=400, detail="Empty input SQL.")
+    sql_in = enforce_safety(sql_in)
+    validate_sql(sql_in, "mysql")
+
+    schema_subset = shortlist_schema(full_schema, sql_in, max_tables=10)
+
+    # First attempt
+    raw1 = await openrouter_chat(SYSTEM_OPTIMIZE, build_optimize_user_prompt(sql_in, schema_subset))
+    sql1 = clean_sql_only(raw1)
+
+    # Retry once if empty or invalid
+    if not sql1:
+        raw2 = await openrouter_chat(
+            SYSTEM_OPTIMIZE,
+            build_optimize_user_prompt(
+                sql_in + "\n\nIMPORTANT: Output only a single non-empty MySQL query. No fences. No commentary.",
+                schema_subset
+            )
+        )
+        sql2 = clean_sql_only(raw2)
+        if not sql2:
+            raise HTTPException(status_code=400, detail=f"Optimizer returned empty SQL. Raw: {raw2[:300]}")
+        sql = sql2
+    else:
+        sql = sql1
+
+    sql = enforce_safety(sql)
+    validate_sql(sql, "mysql")
+
+    # Hard rule: reject SELECT * outputs
+    if re.search(r"(?i)\bselect\s+\*\b|\b\w+\.\*\b", sql):
+        raise HTTPException(status_code=400, detail=f"Optimizer violated rule (SELECT *). Raw output: {raw1[:300]}")
+
+    return SQLResponse(sql=sql, notes="Optimized via OpenRouter (explicit columns, no SELECT *).")
+
+@app.post("/suggest-next", response_model=SuggestNextResponse)
+async def suggest_next(req: SuggestNextRequest):
+    full_schema = require_schema(req.db_key)
+    shortlist_text = f"{req.question or ''}\n{req.sql or ''}\n{req.sample_rows_json or ''}"
+    schema_subset = shortlist_schema(full_schema, shortlist_text, max_tables=12)
+
+    user_prompt = build_suggest_user_prompt(
+        schema_subset=schema_subset,
+        question=req.question,
+        sql=req.sql,
+        sample_rows_json=req.sample_rows_json,
+        k=req.max_suggestions
+    )
+
+    raw = await openrouter_chat(SYSTEM_SUGGEST, user_prompt)
+    try:
+        data = safe_parse_json(raw)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Suggestions JSON parse failed: {str(e)}. Raw: {raw[:300]}")
+
+    queries = data.get("queries", []) or data.get("suggestions", [])
+    # Convert old format if needed
+    if queries and isinstance(queries[0], str):
+        queries = [{"sql": q, "title": f"Suggestion {i+1}"} for i, q in enumerate(queries)]
+        
+    joins = data.get("joins", [])
+    checks = data.get("checks", [])
+
+    # Clamp sizes
+    queries = queries[:req.max_suggestions]
+    joins = joins[:8]
+    checks = checks[:8]
+
+    return SuggestNextResponse(
+        queries=queries,
+        joins=joins,
+        checks=checks,
+        notes=f"Generated {len(queries)} suggestions based on k={req.max_suggestions}"
+    )
 
