@@ -197,6 +197,14 @@ def schema_from_ddl(ddl: str, dialect: str) -> dict:
 # ----------------------------
 # API MODELS
 # ----------------------------
+class UserAuthRequest(BaseModel):
+    email: str
+    password: str
+
+class AuthResponse(BaseModel):
+    user: Dict[str, Any]
+    message: str
+    
 class UploadSchemaRequest(BaseModel):
     db_key: str = "default"
     schema_sql: str
@@ -234,6 +242,70 @@ def require_schema(db_key: str) -> dict:
 # ----------------------------
 # ENDPOINTS
 # ----------------------------
+@app.post("/api/signup")
+async def signup(req: UserAuthRequest):
+    try:
+        res = supabase.auth.sign_up({
+            "email": req.email,
+            "password": req.password,
+        })
+
+        if not res.user:
+            raise HTTPException(status_code=400, detail={"error": "signup_failed", "message": "Signup failed. Please try again."})
+
+        # Profile upsert (don’t hard-fail if RLS blocks it)
+        try:
+            supabase.table("profiles").upsert({
+                "id": res.user.id,
+                "email": req.email,
+                "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }, on_conflict="id").execute()
+        except Exception as e:
+            logger.warning(f"Profile upsert failed (likely RLS), ignoring: {e}")
+
+        return {
+            "user": {"email": req.email, "id": res.user.id},
+            "message": "Signup successful. Check your email to confirm."
+        }
+
+    except Exception as e:
+        msg = str(e).lower()
+        if "user already registered" in msg or "already exists" in msg:
+            raise HTTPException(status_code=400, detail={"error": "email_exists", "message": "Email already exists."})
+        raise HTTPException(status_code=400, detail={"error": "signup_failed", "message": "Signup failed. Please try again."})
+
+
+@app.post("/api/login")
+async def login(req: UserAuthRequest):
+    try:
+        res = supabase.auth.sign_in_with_password({
+            "email": req.email,
+            "password": req.password,
+        })
+
+        if not res.user:
+            raise HTTPException(status_code=401, detail={"error": "invalid_credentials", "message": "Invalid email or password"})
+
+        # Best-effort profile upsert (don’t break login)
+        try:
+            supabase.table("profiles").upsert({
+                "id": res.user.id,
+                "email": req.email,
+                "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }, on_conflict="id").execute()
+        except Exception as e:
+            logger.warning(f"Profile upsert failed (likely RLS), ignoring: {e}")
+
+        return {"user": {"email": req.email, "id": res.user.id}, "message": "Login successful"}
+
+    except Exception as e:
+        error_str = str(e).lower()
+        if "invalid login credentials" in error_str:
+            raise HTTPException(status_code=401, detail={"error": "invalid_credentials", "message": "Invalid email or password"})
+        if "email not confirmed" in error_str:
+            raise HTTPException(status_code=401, detail={"error": "email_not_confirmed", "message": "Email not confirmed. Please verify your email."})
+        raise HTTPException(status_code=401, detail={"error": "auth_error", "message": "Authentication failed"})
+
 @app.post("/upload-schema")
 def upload_schema(req: UploadSchemaRequest):
     dialect = normalize_dialect(req.database_type)
@@ -282,3 +354,4 @@ async def explain_sql(req: ExplainSQLRequest):
     system = get_system_prompt("explain", req.database_type)
     raw = await openrouter_chat(system, req.sql)
     return ExplainResponse(explanation=raw.strip())
+
