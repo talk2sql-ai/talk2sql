@@ -26,7 +26,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const signIn = async (email: string, password: string) => {
     setIsLoading(true);
     try {
-      const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      const apiUrl = (import.meta.env.VITE_API_URL || 'http://localhost:8000').trim();
       const response = await fetch(`${apiUrl}/api/login`, {
         method: 'POST',
         headers: {
