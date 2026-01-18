@@ -12,13 +12,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from collections import deque, defaultdict
 from supabase import create_client
 
 load_dotenv()
 
+# ----------------------------
+# App + Logging
+# ----------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("text2sql")
 
 app = FastAPI(title="Text2SQL MVP")
 app.add_middleware(
@@ -29,11 +31,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------
+# Supabase
+# ----------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    logger.warning("Supabase env missing: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
-SCHEMA_CACHE: Dict[str, Any] = {}
+supabase = create_client(SUPABASE_URL or "", SUPABASE_SERVICE_ROLE_KEY or "")
+
+# ----------------------------
+# Cache (schema + dialect + parse errors)
+# ----------------------------
+# SCHEMA_CACHE[db_key] = {"schema": {...}, "dialect": "postgres", "parse_errors": [...]}
+SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ----------------------------
 # Dialect handling
@@ -42,8 +54,15 @@ DIALECT_MAP = {
     "mysql": "mysql",
     "postgres": "postgres",
     "postgresql": "postgres",
+    "pg": "postgres",
     "sqlite": "sqlite",
     "sqlite3": "sqlite",
+}
+
+DIALECT_DISPLAY = {
+    "mysql": "MySQL 8",
+    "postgres": "PostgreSQL 14+",
+    "sqlite": "SQLite 3",
 }
 
 def normalize_dialect(db_type: Optional[str]) -> str:
@@ -52,16 +71,33 @@ def normalize_dialect(db_type: Optional[str]) -> str:
     t = db_type.lower().strip()
     return DIALECT_MAP.get(t, "mysql")
 
-def get_dialect_name(db_type: str) -> str:
-    return {
-        "mysql": "MySQL 8",
-        "postgres": "PostgreSQL 14+",
-        "sqlite": "SQLite 3"
-    }.get(normalize_dialect(db_type), "MySQL 8")
+def get_dialect_name(normalized_dialect: str) -> str:
+    return DIALECT_DISPLAY.get(normalized_dialect, "MySQL 8")
+
+def resolve_effective_dialect(db_key: str, request_db_type: Optional[str]) -> str:
+    """
+    Priority:
+    1) If request_db_type provided -> use it
+    2) Else use cached dialect for this db_key
+    3) Else default mysql
+    """
+    if request_db_type:
+        return normalize_dialect(request_db_type)
+    cached = SCHEMA_CACHE.get(db_key)
+    if cached and cached.get("dialect"):
+        return cached["dialect"]
+    return "mysql"
 
 # ----------------------------
-# Output hygiene (TEXT ONLY)
+# Output hygiene
 # ----------------------------
+def clamp_int(x: int, lo: int, hi: int) -> int:
+    try:
+        v = int(x)
+    except Exception:
+        return lo
+    return max(lo, min(hi, v))
+
 def enforce_single_statement(sql: str) -> str:
     if not sql:
         raise HTTPException(status_code=400, detail="Empty SQL output.")
@@ -69,29 +105,48 @@ def enforce_single_statement(sql: str) -> str:
     if len(parts) > 1:
         raise HTTPException(
             status_code=400,
-            detail="Multiple SQL statements detected. Please generate one statement at a time."
+            detail="Multiple SQL statements detected. Generate one statement only."
         )
-    return parts[0]
+    return parts[0].strip()
 
-def validate_sql(sql: str, dialect: str):
+def clean_sql_only(text: str) -> str:
+    """
+    Extract first SQL-like statement. Removes markdown fences.
+    """
+    if not text:
+        return ""
+    t = text.strip()
+    t = re.sub(r"^```[\w]*\s*", "", t)
+    t = re.sub(r"\s*```$", "", t).strip()
+
+    starters = r"(with|select|insert|update|delete|create|alter|drop|truncate|merge|replace|grant|revoke|explain)"
+    m = re.search(rf"(?is)\b{starters}\b[\s\S]*?(?=;|$)", t)
+    if m:
+        return m.group(0).strip().strip(";").strip()
+
+    return t.strip().strip(";").strip()
+
+def validate_sql(sql: str, dialect: str) -> None:
     try:
         sqlglot.parse_one(sql, read=dialect)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid {dialect} SQL: {str(e)}")
 
-def clean_sql_only(text: str) -> str:
-    if not text:
-        return ""
-    t = text.strip()
-    t = re.sub(r"^```[\w]*\s*", "", t)
-    t = re.sub(r"\s*```$", "", t)
+def enforce_limit(sql: str, limit: int, dialect: str) -> str:
+    """
+    Adds LIMIT if query is a SELECT and has no LIMIT.
+    Dialect aware: mysql/postgres/sqlite all accept LIMIT.
+    """
+    s = sql.strip().rstrip(";")
+    try:
+        parsed = sqlglot.parse_one(s, read=dialect)
+    except Exception:
+        return s  # can't parse, don't mutate
 
-    starters = r"(with|select|insert|update|delete|create|alter|drop|truncate|merge|replace|grant|revoke|explain)"
-    m = re.search(rf"(?is)\b{starters}\b[\s\S]*?(?=;|$)", t)
-    if m:
-        return m.group(0).strip().strip(";")
-
-    return t.strip().strip(";")
+    if getattr(parsed, "key", "") == "select":
+        if "limit" not in s.lower():
+            return f"{s} LIMIT {limit}"
+    return s
 
 # ----------------------------
 # OpenRouter
@@ -101,9 +156,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 async def openrouter_chat(system: str, user: str) -> str:
     api_key = os.getenv("OPENROUTER_API_KEY")
     model = os.getenv("OPENROUTER_MODEL")
-
     if not api_key or not model:
-        raise HTTPException(status_code=500, detail="OpenRouter not configured")
+        raise HTTPException(status_code=500, detail="OpenRouter not configured (OPENROUTER_API_KEY / OPENROUTER_MODEL).")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -123,45 +177,87 @@ async def openrouter_chat(system: str, user: str) -> str:
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(OPENROUTER_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        try:
+            r.raise_for_status()
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"OpenRouter error: {r.text}")
+        data = r.json()
+
+    return data["choices"][0]["message"]["content"]
 
 # ----------------------------
-# SYSTEM PROMPTS (DYNAMIC)
+# System prompts (dialect-specific)
 # ----------------------------
-def get_system_prompt(mode: str, db_type: str) -> str:
-    dialect = normalize_dialect(db_type)
-
-    base = f"""
+def system_generate(dialect: str) -> str:
+    return f"""
 You are an expert SQL engineer.
-You MUST use {get_dialect_name(db_type)} syntax ONLY.
+You MUST use {get_dialect_name(dialect)} syntax ONLY.
 Output ONLY SQL. No markdown. No explanations.
-Use ONLY tables and columns from the schema.
+Use ONLY tables and columns from the schema JSON.
 Generate exactly ONE SQL statement.
+If ambiguous, pick the most reasonable query.
 """
 
-    if mode == "explain":
-        return f"You are a {get_dialect_name(db_type)} expert. Explain the SQL clearly using bullet points."
+def system_fix(dialect: str) -> str:
+    return f"""
+You are a {get_dialect_name(dialect)} SQL expert.
+Fix the SQL to match the schema.
+Output ONLY the corrected SQL. No markdown. No explanations.
+Generate exactly ONE SQL statement.
+Preserve intent.
+"""
 
-    if mode == "suggest":
-        return f"""
-You are a {get_dialect_name(db_type)} analyst.
+def system_explain(dialect: str) -> str:
+    return f"""
+You are a {get_dialect_name(dialect)} expert.
+Explain the SQL clearly in bullet points.
+No markdown headings. Keep it readable.
+"""
+
+def system_optimize(dialect: str) -> str:
+    return f"""
+You are a {get_dialect_name(dialect)} performance engineer.
+Return ONLY an optimized SQL query with the SAME intent.
+No markdown. No explanation.
+Generate exactly ONE statement.
+Do not invent columns/tables.
+"""
+
+def system_suggest(dialect: str) -> str:
+    return f"""
+You are a {get_dialect_name(dialect)} analyst copilot.
 Return valid JSON ONLY with keys:
-queries (list of {{sql, title}}), joins, checks.
+queries (list of objects {{sql, title}}), joins (list of strings), checks (list of strings).
+Each sql must be exactly ONE statement.
+Use ONLY schema tables/columns.
 """
 
-    return base
+def safe_parse_json(text: str) -> dict:
+    t = (text or "").strip()
+    t = re.sub(r"^```[\w]*\s*", "", t)
+    t = re.sub(r"\s*```$", "", t).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        m = re.search(r"(\{[\s\S]*\})", t)
+        if not m:
+            raise ValueError("No JSON object found.")
+        return json.loads(m.group(1))
 
 # ----------------------------
-# Schema ingestion
+# Schema parsing (DDL -> schema JSON)
 # ----------------------------
 def split_create_table_statements(ddl: str) -> List[str]:
+    """
+    Basic splitter for CREATE TABLE blocks.
+    """
     if not ddl:
         return []
     stmts = []
     current = []
     depth = 0
     for line in ddl.splitlines():
+        # skip SQL comments
         if line.strip().startswith("--"):
             continue
         current.append(line)
@@ -171,58 +267,134 @@ def split_create_table_statements(ddl: str) -> List[str]:
             if stmt:
                 stmts.append(stmt)
             current = []
+    # in case last statement has no semicolon
+    if current:
+        stmt = "\n".join(current).strip()
+        if stmt:
+            stmts.append(stmt)
     return stmts
 
 def schema_from_ddl(ddl: str, dialect: str) -> dict:
-    tables = {}
-    errors = []
+    """
+    Returns:
+    {
+      "tables": {
+        "table": {"columns": [{"name": "...", "type": "..."}]}
+      },
+      "parse_errors": [...]
+    }
+    """
+    tables: Dict[str, Any] = {}
+    errors: List[str] = []
+
     stmts = split_create_table_statements(ddl)
     for s in stmts:
         try:
             parsed = sqlglot.parse_one(s, read=dialect)
             if not isinstance(parsed, exp.Create):
                 continue
-            name = parsed.this.this.name
-            tables[name] = {"columns": []}
-            for col in parsed.this.expressions:
-                if isinstance(col, exp.ColumnDef):
-                    tables[name]["columns"].append({
-                        "name": col.this.name,
-                        "type": str(col.kind)
-                    })
+
+            # CREATE TABLE <this>
+            # sqlglot structure varies; these are common safe paths:
+            table_expr = parsed.this
+            table_name = None
+
+            if isinstance(table_expr, exp.Table):
+                table_name = table_expr.name
+            else:
+                tnode = table_expr.find(exp.Table) if hasattr(table_expr, "find") else None
+                if isinstance(tnode, exp.Table):
+                    table_name = tnode.name
+
+            if not table_name:
+                continue
+
+            if table_name not in tables:
+                tables[table_name] = {"columns": []}
+
+            schema_node = parsed.find(exp.Schema)
+            if not schema_node:
+                continue
+
+            for coldef in schema_node.find_all(exp.ColumnDef):
+                col_name = coldef.this.name if coldef.this else None
+                dtype = coldef.args.get("kind")
+                col_type = dtype.sql(dialect=dialect) if isinstance(dtype, exp.DataType) else (str(dtype) if dtype else "UNKNOWN")
+                if col_name:
+                    tables[table_name]["columns"].append({"name": col_name, "type": col_type})
+
         except Exception as e:
             errors.append(str(e))
+
     return {"tables": tables, "parse_errors": errors}
 
 # ----------------------------
-# API MODELS
+# Schema shortlisting (cheap MVP)
+# ----------------------------
+def shortlist_schema(full_schema: dict, text: str, max_tables: int = 8) -> dict:
+    """
+    full_schema = {"tables": {...}, "parse_errors": [...]}
+    """
+    q = set(re.findall(r"[a-zA-Z_]+", (text or "").lower()))
+    scored = []
+
+    tables = (full_schema or {}).get("tables", {}) or {}
+    for t, info in tables.items():
+        tokens = {t.lower()}
+        for c in info.get("columns", []):
+            tokens.add((c.get("name") or "").lower())
+        score = len(q.intersection(tokens))
+        if score > 0:
+            scored.append((score, t))
+
+    scored.sort(reverse=True)
+    chosen = [t for _, t in scored[:max_tables]]
+
+    if not chosen:
+        chosen = list(tables.keys())[:max_tables]
+
+    return {"tables": {t: tables[t] for t in chosen}}
+
+# ----------------------------
+# API Models
 # ----------------------------
 class UserAuthRequest(BaseModel):
     email: str
     password: str
 
-class AuthResponse(BaseModel):
-    user: Dict[str, Any]
-    message: str
-    
 class UploadSchemaRequest(BaseModel):
     db_key: str = "default"
     schema_sql: str
-    database_type: str = "mysql"
+    database_type: str  # REQUIRED from UI (mysql/postgres/sqlite)
 
 class Text2SQLRequest(BaseModel):
     db_key: str = "default"
     question: str
-    database_type: str = "mysql"
+    database_type: Optional[str] = None  # optional; if omitted, use cached dialect
+    constraints: Optional[str] = None
+    max_rows: int = 100
 
 class FixSQLRequest(BaseModel):
     db_key: str = "default"
     sql: str
-    database_type: str = "mysql"
+    database_type: Optional[str] = None
 
 class ExplainSQLRequest(BaseModel):
     sql: str
-    database_type: str = "mysql"
+    database_type: Optional[str] = None
+
+class OptimizeSQLRequest(BaseModel):
+    db_key: str = "default"
+    sql: str
+    database_type: Optional[str] = None
+
+class SuggestNextRequest(BaseModel):
+    db_key: str = "default"
+    question: Optional[str] = None
+    sql: Optional[str] = None
+    sample_rows_json: Optional[str] = None
+    max_suggestions: int = 5
+    database_type: Optional[str] = None
 
 class SQLResponse(BaseModel):
     sql: str
@@ -231,29 +403,32 @@ class SQLResponse(BaseModel):
 class ExplainResponse(BaseModel):
     explanation: str
 
+class SuggestNextResponse(BaseModel):
+    queries: List[Dict[str, Any]]
+    joins: List[str]
+    checks: List[str]
+    notes: Optional[str] = None
+
 # ----------------------------
 # Helpers
 # ----------------------------
-def require_schema(db_key: str) -> dict:
-    if db_key not in SCHEMA_CACHE:
-        raise HTTPException(status_code=404, detail="Schema not uploaded")
-    return SCHEMA_CACHE[db_key]
+def require_cached(db_key: str) -> Dict[str, Any]:
+    cached = SCHEMA_CACHE.get(db_key)
+    if not cached or not cached.get("schema") or not cached["schema"].get("tables"):
+        raise HTTPException(status_code=404, detail="Schema not uploaded for this db_key.")
+    return cached
 
 # ----------------------------
-# ENDPOINTS
+# ENDPOINTS (ALL under /api)
 # ----------------------------
 @app.post("/api/signup")
 async def signup(req: UserAuthRequest):
     try:
-        res = supabase.auth.sign_up({
-            "email": req.email,
-            "password": req.password,
-        })
+        res = supabase.auth.sign_up({"email": req.email, "password": req.password})
+        if not getattr(res, "user", None):
+            raise HTTPException(status_code=400, detail={"error": "signup_failed", "message": "Signup failed."})
 
-        if not res.user:
-            raise HTTPException(status_code=400, detail={"error": "signup_failed", "message": "Signup failed. Please try again."})
-
-        # Profile upsert (don’t hard-fail if RLS blocks it)
+        # best-effort profile upsert (ignore if RLS blocks)
         try:
             supabase.table("profiles").upsert({
                 "id": res.user.id,
@@ -261,32 +436,22 @@ async def signup(req: UserAuthRequest):
                 "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }, on_conflict="id").execute()
         except Exception as e:
-            logger.warning(f"Profile upsert failed (likely RLS), ignoring: {e}")
+            logger.warning(f"Profile upsert failed (ignore): {e}")
 
-        return {
-            "user": {"email": req.email, "id": res.user.id},
-            "message": "Signup successful. Check your email to confirm."
-        }
-
+        return {"user": {"email": req.email, "id": res.user.id}, "message": "Signup successful. Check your email to confirm."}
     except Exception as e:
         msg = str(e).lower()
-        if "user already registered" in msg or "already exists" in msg:
+        if "already" in msg and "registered" in msg:
             raise HTTPException(status_code=400, detail={"error": "email_exists", "message": "Email already exists."})
-        raise HTTPException(status_code=400, detail={"error": "signup_failed", "message": "Signup failed. Please try again."})
-
+        raise HTTPException(status_code=400, detail={"error": "signup_failed", "message": "Signup failed."})
 
 @app.post("/api/login")
 async def login(req: UserAuthRequest):
     try:
-        res = supabase.auth.sign_in_with_password({
-            "email": req.email,
-            "password": req.password,
-        })
+        res = supabase.auth.sign_in_with_password({"email": req.email, "password": req.password})
+        if not getattr(res, "user", None):
+            raise HTTPException(status_code=401, detail={"error": "invalid_credentials", "message": "Invalid email or password."})
 
-        if not res.user:
-            raise HTTPException(status_code=401, detail={"error": "invalid_credentials", "message": "Invalid email or password"})
-
-        # Best-effort profile upsert (don’t break login)
         try:
             supabase.table("profiles").upsert({
                 "id": res.user.id,
@@ -294,204 +459,184 @@ async def login(req: UserAuthRequest):
                 "last_login": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }, on_conflict="id").execute()
         except Exception as e:
-            logger.warning(f"Profile upsert failed (likely RLS), ignoring: {e}")
+            logger.warning(f"Profile upsert failed (ignore): {e}")
 
         return {"user": {"email": req.email, "id": res.user.id}, "message": "Login successful"}
-
     except Exception as e:
-        error_str = str(e).lower()
-        if "invalid login credentials" in error_str:
-            raise HTTPException(status_code=401, detail={"error": "invalid_credentials", "message": "Invalid email or password"})
-        if "email not confirmed" in error_str:
+        s = str(e).lower()
+        if "email not confirmed" in s:
             raise HTTPException(status_code=401, detail={"error": "email_not_confirmed", "message": "Email not confirmed. Please verify your email."})
-        raise HTTPException(status_code=401, detail={"error": "auth_error", "message": "Authentication failed"})
+        if "invalid login credentials" in s:
+            raise HTTPException(status_code=401, detail={"error": "invalid_credentials", "message": "Invalid email or password."})
+        raise HTTPException(status_code=401, detail={"error": "auth_error", "message": "Authentication failed."})
 
-@app.post("/upload-schema")
-def upload_schema(req: UploadSchemaRequest):
+@app.post("/api/upload-schema")
+def upload_schema_api(req: UploadSchemaRequest):
     dialect = normalize_dialect(req.database_type)
     schema = schema_from_ddl(req.schema_sql, dialect)
 
-    if not schema["tables"]:
-        raise HTTPException(status_code=400, detail="No tables parsed from schema.")
+    if not schema.get("tables"):
+        raise HTTPException(status_code=400, detail="No tables parsed. Ensure DDL matches selected database type.")
 
-    SCHEMA_CACHE[req.db_key] = schema
-    return {
-        "status": "ok",
-        "tables": len(schema["tables"]),
-        "warning": "Ensure schema matches selected database type."
+    SCHEMA_CACHE[req.db_key] = {
+        "schema": schema,
+        "dialect": dialect,
+        "parse_errors": schema.get("parse_errors", []),
     }
 
-@app.post("/generate-sql", response_model=SQLResponse)
-async def generate_sql(req: Text2SQLRequest):
-    full_schema = require_schema(req.db_key)
-    schema_subset = shortlist_schema(full_schema, req.question, max_tables=8)
-    user_prompt = build_generate_user_prompt(
-        req.question,
-        schema_subset,
-        req.constraints,
-        req.max_rows
-    )
-    raw = await openrouter_chat(SYSTEM_GENERATE, user_prompt)
-    sql = clean_sql_only(raw)
+    warning = None
+    if schema.get("parse_errors"):
+        warning = "Some DDL statements could not be parsed. Ensure DDL matches selected database type."
 
-    sql = enforce_safety(sql)
-    sql = enforce_limit(sql, req.max_rows)
-    validate_sql(sql, "mysql")
+    return {
+        "status": "ok",
+        "db_key": req.db_key,
+        "tables": len(schema["tables"]),
+        "dialect": dialect,
+        "warning": warning
+    }
 
-    return SQLResponse(sql=sql, notes="Generated via OpenRouter (MySQL).")
+@app.post("/api/generate-sql", response_model=SQLResponse)
+async def generate_sql_api(req: Text2SQLRequest):
+    cached = require_cached(req.db_key)
+    dialect = resolve_effective_dialect(req.db_key, req.database_type)
+    full_schema = cached["schema"]
+    max_rows = clamp_int(req.max_rows, 1, 10000)
 
+    schema_subset = shortlist_schema(full_schema, f"{req.question}\n{req.constraints or ''}", max_tables=8)
 
-@app.post("/fix-sql", response_model=SQLResponse)
-async def fix_sql(req: FixSQLRequest):
-    full_schema = require_schema(req.db_key)
-    sql_in = clean_sql_only(req.sql)
-    if not sql_in:
-        raise HTTPException(status_code=400, detail="Empty input SQL.")
+    system = system_generate(dialect)
+    user = f"""
+Question:
+{req.question}
 
-    error_msg = (req.error or "").strip()
+Constraints:
+{req.constraints or "None"}
 
-    # Deterministic replacement if error mentions Unknown column
-    m = re.search(r"Unknown column '([^']+)'", error_msg, re.IGNORECASE)
-    if m:
-        bad_col = m.group(1)
-        t = re.search(r"from\s+([a-zA-Z_][\w]*)", sql_in, re.IGNORECASE)
-        if t:
-            table = t.group(1)
-            replacement = find_closest_column(full_schema, table, bad_col)
-            if replacement and replacement.lower() != bad_col.lower():
-                sql_in = re.sub(rf"\b{re.escape(bad_col)}\b", replacement, sql_in)
+Schema (JSON):
+{json.dumps(schema_subset, indent=2)}
 
-    shortlist_text = f"{sql_in}\n{error_msg}"
-    schema_subset = shortlist_schema(full_schema, shortlist_text, max_tables=10)
+Return exactly ONE SQL statement for {get_dialect_name(dialect)}.
+"""
 
-    if not error_msg:
-        try:
-            sqlglot.parse_one(sql_in, read="mysql")
-            error_msg = "SQL may be valid but needs a compatibility/intent-preserving fix."
-        except Exception as e:
-            error_msg = f"Parse error: {str(e)}"
+    raw = await openrouter_chat(system, user)
+    sql = enforce_single_statement(clean_sql_only(raw))
+    validate_sql(sql, dialect)
 
-    # First attempt
-    raw1 = await openrouter_chat(SYSTEM_FIX, build_fix_user_prompt(sql_in, error_msg, schema_subset))
-    sql1 = clean_sql_only(raw1)
+    # Optional safety: enforce a LIMIT for SELECTs
+    sql = enforce_limit(sql, max_rows, dialect)
 
-    # Retry once if empty
-    if not sql1:
-        raw2 = await openrouter_chat(
-            SYSTEM_FIX,
-            build_fix_user_prompt(
-                sql_in,
-                error_msg + " IMPORTANT: Output ONLY a single non-empty MySQL query. No fences. No commentary.",
-                schema_subset
-            )
-        )
-        sql2 = clean_sql_only(raw2)
-        if not sql2:
-            raise HTTPException(status_code=400, detail=f"Fixer returned empty SQL. Raw: {raw2[:300]}")
-        sql = sql2
-        raw_used = raw2
-    else:
-        sql = sql1
-        raw_used = raw1
+    return SQLResponse(sql=sql, notes=f"dialect={dialect}, max_rows={max_rows}")
 
-    sql = enforce_safety(sql)
-    sql = enforce_limit(sql, 100)
+@app.post("/api/fix-sql", response_model=SQLResponse)
+async def fix_sql_api(req: FixSQLRequest):
+    cached = require_cached(req.db_key)
+    dialect = resolve_effective_dialect(req.db_key, req.database_type)
+    full_schema = cached["schema"]
 
-    # Validate after enforcement
-    try:
-        validate_sql(sql, "mysql")
-    except HTTPException as e:
-        raise HTTPException(status_code=400, detail=f"{e.detail}. Raw output: {raw_used[:300]}")
+    system = system_fix(dialect)
+    user = f"""
+Fix this SQL (keep same intent):
+{req.sql}
 
-    return SQLResponse(sql=sql, notes="Fixed via deterministic map + OpenRouter (retry-on-empty).")
+Schema (JSON):
+{json.dumps(full_schema, indent=2)}
 
+Return exactly ONE corrected SQL statement for {get_dialect_name(dialect)}.
+"""
 
-@app.post("/explain-sql", response_model=ExplainResponse)
-async def explain_sql(req: ExplainSQLRequest):
-    sql = clean_sql_only(req.sql)
-    sql = enforce_safety(sql)
-    validate_sql(sql, "mysql")
+    raw = await openrouter_chat(system, user)
+    sql = enforce_single_statement(clean_sql_only(raw))
+    validate_sql(sql, dialect)
 
-    raw = await openrouter_chat(SYSTEM_EXPLAIN, build_explain_user_prompt(sql))
+    return SQLResponse(sql=sql, notes=f"dialect={dialect}")
+
+@app.post("/api/explain-sql", response_model=ExplainResponse)
+async def explain_sql_api(req: ExplainSQLRequest):
+    dialect = normalize_dialect(req.database_type) if req.database_type else "mysql"
+    system = system_explain(dialect)
+    raw = await openrouter_chat(system, req.sql)
     return ExplainResponse(explanation=raw.strip())
 
-@app.post("/optimize-sql", response_model=SQLResponse)
-async def optimize_sql(req: OptimizeSQLRequest):
-    full_schema = require_schema(req.db_key)
-    sql_in = clean_sql_only(req.sql)
-    if not sql_in:
-        raise HTTPException(status_code=400, detail="Empty input SQL.")
-    sql_in = enforce_safety(sql_in)
-    validate_sql(sql_in, "mysql")
+@app.post("/api/optimize-sql", response_model=SQLResponse)
+async def optimize_sql_api(req: OptimizeSQLRequest):
+    cached = require_cached(req.db_key)
+    dialect = resolve_effective_dialect(req.db_key, req.database_type)
+    full_schema = cached["schema"]
 
-    schema_subset = shortlist_schema(full_schema, sql_in, max_tables=10)
+    system = system_optimize(dialect)
+    user = f"""
+Optimize this SQL (same intent):
+{req.sql}
 
-    # First attempt
-    raw1 = await openrouter_chat(SYSTEM_OPTIMIZE, build_optimize_user_prompt(sql_in, schema_subset))
-    sql1 = clean_sql_only(raw1)
+Schema (JSON):
+{json.dumps(full_schema, indent=2)}
 
-    # Retry once if empty or invalid
-    if not sql1:
-        raw2 = await openrouter_chat(
-            SYSTEM_OPTIMIZE,
-            build_optimize_user_prompt(
-                sql_in + "\n\nIMPORTANT: Output only a single non-empty MySQL query. No fences. No commentary.",
-                schema_subset
-            )
-        )
-        sql2 = clean_sql_only(raw2)
-        if not sql2:
-            raise HTTPException(status_code=400, detail=f"Optimizer returned empty SQL. Raw: {raw2[:300]}")
-        sql = sql2
-    else:
-        sql = sql1
+Return exactly ONE optimized SQL statement for {get_dialect_name(dialect)}.
+"""
 
-    sql = enforce_safety(sql)
-    validate_sql(sql, "mysql")
+    raw = await openrouter_chat(system, user)
+    sql = enforce_single_statement(clean_sql_only(raw))
+    validate_sql(sql, dialect)
 
-    # Hard rule: reject SELECT * outputs
-    if re.search(r"(?i)\bselect\s+\*\b|\b\w+\.\*\b", sql):
-        raise HTTPException(status_code=400, detail=f"Optimizer violated rule (SELECT *). Raw output: {raw1[:300]}")
+    return SQLResponse(sql=sql, notes=f"dialect={dialect}")
 
-    return SQLResponse(sql=sql, notes="Optimized via OpenRouter (explicit columns, no SELECT *).")
+@app.post("/api/suggest-next", response_model=SuggestNextResponse)
+async def suggest_next_api(req: SuggestNextRequest):
+    cached = require_cached(req.db_key)
+    dialect = resolve_effective_dialect(req.db_key, req.database_type)
+    full_schema = cached["schema"]
 
-@app.post("/suggest-next", response_model=SuggestNextResponse)
-async def suggest_next(req: SuggestNextRequest):
-    full_schema = require_schema(req.db_key)
-    shortlist_text = f"{req.question or ''}\n{req.sql or ''}\n{req.sample_rows_json or ''}"
-    schema_subset = shortlist_schema(full_schema, shortlist_text, max_tables=12)
+    max_suggestions = clamp_int(req.max_suggestions, 1, 10)
+    context = f"{req.question or ''}\n{req.sql or ''}\n{req.sample_rows_json or ''}"
+    schema_subset = shortlist_schema(full_schema, context, max_tables=12)
 
-    user_prompt = build_suggest_user_prompt(
-        schema_subset=schema_subset,
-        question=req.question,
-        sql=req.sql,
-        sample_rows_json=req.sample_rows_json,
-        k=req.max_suggestions
-    )
+    system = system_suggest(dialect)
+    user = f"""
+k={max_suggestions}
 
-    raw = await openrouter_chat(SYSTEM_SUGGEST, user_prompt)
+Last question:
+{req.question or "None"}
+
+Last SQL:
+{req.sql or "None"}
+
+Sample rows (optional JSON):
+{req.sample_rows_json or "None"}
+
+Schema (JSON):
+{json.dumps(schema_subset, indent=2)}
+
+Return JSON ONLY with keys queries, joins, checks.
+Each queries[i].sql must be ONE statement in {get_dialect_name(dialect)}.
+"""
+
+    raw = await openrouter_chat(system, user)
+
     try:
         data = safe_parse_json(raw)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Suggestions JSON parse failed: {str(e)}. Raw: {raw[:300]}")
+        raise HTTPException(status_code=400, detail=f"Suggestions JSON parse failed: {str(e)}")
 
-    queries = data.get("queries", []) or data.get("suggestions", [])
-    # Convert old format if needed
-    if queries and isinstance(queries[0], str):
-        queries = [{"sql": q, "title": f"Suggestion {i+1}"} for i, q in enumerate(queries)]
-        
-    joins = data.get("joins", [])
-    checks = data.get("checks", [])
+    queries = data.get("queries", []) or []
+    joins = data.get("joins", []) or []
+    checks = data.get("checks", []) or []
 
-    # Clamp sizes
-    queries = queries[:req.max_suggestions]
-    joins = joins[:8]
-    checks = checks[:8]
+    # sanitize + clamp
+    cleaned_queries = []
+    for q in queries[:max_suggestions]:
+        if isinstance(q, dict) and q.get("sql"):
+            sql = enforce_single_statement(clean_sql_only(q["sql"]))
+            # validate each suggested SQL for the dialect
+            try:
+                validate_sql(sql, dialect)
+            except Exception:
+                continue
+            cleaned_queries.append({"sql": sql, "title": q.get("title", "Suggestion")})
 
     return SuggestNextResponse(
-        queries=queries,
-        joins=joins,
-        checks=checks,
-        notes=f"Generated {len(queries)} suggestions based on k={req.max_suggestions}"
+        queries=cleaned_queries,
+        joins=[str(x) for x in joins[:8]],
+        checks=[str(x) for x in checks[:8]],
+        notes=f"dialect={dialect}, returned={len(cleaned_queries)}"
     )
-
