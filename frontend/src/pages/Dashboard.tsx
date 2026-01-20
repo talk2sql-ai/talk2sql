@@ -77,11 +77,12 @@ export default function Dashboard() {
     try {
       const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-      let endpoint = '/generate-sql';
-      if (operation === 'fix') endpoint = '/fix-sql';
-      if (operation === 'explain') endpoint = '/explain-sql';
-      if (operation === 'optimize') endpoint = '/optimize-sql';
-      if (operation === 'suggest') endpoint = '/suggest-next';
+      let endpoint = '/api/generate-sql';
+      if (operation === 'fix') endpoint = '/api/fix-sql';
+      if (operation === 'explain') endpoint = '/api/explain-sql';
+      if (operation === 'optimize') endpoint = '/api/optimize-sql';
+      if (operation === 'suggest') endpoint = '/api/suggest-next';
+
 
       const payload: any = {
         db_key: 'default',
