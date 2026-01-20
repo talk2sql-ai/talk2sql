@@ -53,7 +53,7 @@ export default function OnboardingPage() {
             const syncSchema = async () => {
                 try {
                     const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-                    await fetch(`${apiUrl}/upload-schema`, {
+                    await fetch(`${apiUrl}/api/upload-schema`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -79,7 +79,7 @@ export default function OnboardingPage() {
         setIsLoading(true);
         try {
             const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-            const response = await fetch(`${apiUrl}/upload-schema`, {
+            const response = await fetch(`${apiUrl}/api/upload-schema`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -347,5 +347,6 @@ export default function OnboardingPage() {
         </div>
     );
 }
+
 
 
